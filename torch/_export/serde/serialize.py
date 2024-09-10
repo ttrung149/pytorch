@@ -72,6 +72,7 @@ from .schema import (  # type: ignore[attr-defined]
     ModuleCallEntry,
     ModuleCallSignature,
     NamedArgument,
+    NNModuleFrame,
     Node,
     OptionalTensorArgument,
     OutputSpec,
@@ -579,21 +580,13 @@ class GraphModuleSerializer(metaclass=Final):
             ret["stack_trace"] = stack_trace
 
         if nn_module_stack := node.meta.get("nn_module_stack"):
-
-            def export_nn_module_stack(val):
-                assert isinstance(val, tuple) and len(val) == 2
-                path, ty = val
-
-                assert isinstance(path, str)
-                assert isinstance(ty, str)
-
-                return path + "," + ty
-
-            # Serialize to "key,orig_path,type_str"
-            nn_module_list = [
-                f"{k},{export_nn_module_stack(v)}" for k, v in nn_module_stack.items()
-            ]
-            ret["nn_module_stack"] = ST_DELIMITER.join(nn_module_list)
+            nn_module_list = []
+            for k, v in nn_module_stack.items():
+                assert isinstance(v, tuple) and len(v) == 2
+                nn_module_list.append(
+                    _dataclass_to_dict(NNModuleFrame(k, v[0], v[1]))
+                )
+            ret["nn_module_stack"] = json.dumps(nn_module_list)
 
         if source_fn_st := node.meta.get("source_fn_stack"):
             source_fn_list = [
@@ -1424,11 +1417,12 @@ class GraphModuleDeserializer(metaclass=Final):
         constants: Dict[str, Union[torch.Tensor, FakeScriptObject, torch.ScriptObject]]
         example_inputs: Optional[Tuple[Tuple[torch.Tensor, ...], Dict[str, Any]]]
 
-    def __init__(self) -> None:
+    def __init__(self, schema_version: SchemaVersion) -> None:
         self.serialized_name_to_node: Dict[str, torch.fx.Node] = {}
         self.serialized_name_to_meta: Dict[str, MetaType] = {}
         self.graph = torch.fx.Graph()
         self.module = torch.nn.Module()
+        self.schema_version = schema_version  # schema version of the serialized program
 
     @contextmanager
     def save_graph_module(self) -> Iterator[None]:
@@ -2188,26 +2182,38 @@ class GraphModuleDeserializer(metaclass=Final):
             return target
 
         if nn_module_stack_str := metadata.get("nn_module_stack"):
-            # Originally serialized to "key,orig_path,type_str"
-            def import_nn_module_stack(key, path, ty):
-                return key, (path, ty)
+            # explicitly check the serializer version for nn_module_stack BC
+            if self.schema_version.major == 7 and self.schema_version.minor < SCHEMA_VERSION[1]:
+                log.warning("The program is from an older serializer.")
 
-            # Helper function that splits strings by commas except for those
-            # encapsulated by parens, which are valid traces.
-            # TODO: Currently this is needed due to indexing Sequential
-            # layers introducing names in the form "layer.slice(1, None, None)".
-            # If that naming is improved, this fancier splitting can probably be
-            # reverted to a simple split by comma.
-            def metadata_split(metadata):
-                # Remove the parentheses and commas inside them
-                metadata = re.sub(r'\(.*?\)', '', metadata)
-                # Split the string by comma, except for those inside parentheses
-                return re.split(r'(?<!\()\s*,\s*(?!\()', metadata)
+                # Originally serialized to "key,orig_path,type_str"
+                def import_nn_module_stack(key, path, ty):
+                    return key, (path, ty)
 
-            nn_module_stack = dict(
-                import_nn_module_stack(*metadata_split(item))
-                for item in nn_module_stack_str.split(ST_DELIMITER)
-            )
+                def metadata_split(metadata):
+                    # Remove the parentheses and commas inside them
+                    metadata = re.sub(r'\(.*?\)', '', metadata)
+                    # Split the string by comma, except for those inside parentheses
+                    return re.split(r'(?<!\()\s*,\s*(?!\()', metadata)
+
+                nn_module_stack = dict(
+                    import_nn_module_stack(*metadata_split(item))
+                    for item in nn_module_stack_str.split(ST_DELIMITER)
+                )
+            else:
+                nn_module_dict_list = json.loads(nn_module_stack_str)
+                nn_module_list = [
+                    NNModuleFrame(
+                        key=frame_dict["key"],
+                        path=frame_dict["path"],
+                        ty=frame_dict["ty"],
+                    ) for frame_dict in nn_module_dict_list
+                ]
+                nn_module_stack = {
+                    frame.key: (frame.path, frame.ty)
+                    for frame in nn_module_list
+                }
+
             ret["nn_module_stack"] = nn_module_stack
 
         if source_fn_st_str := metadata.get("source_fn_stack"):
@@ -2296,10 +2302,10 @@ class ExportedProgramDeserializer(metaclass=Final):
         example_inputs: Optional[Union[Tuple[Tuple[torch.Tensor, ...], Dict[str, Any]], bytes]] = None,
     ) -> ep.ExportedProgram:
         assert isinstance(exported_program, ExportedProgram)
-        version = exported_program.schema_version
+        schema_version = exported_program.schema_version
 
         # TODO(zhxchen17) blocked on thrift schema refactor
-        if version.major != SCHEMA_VERSION[0] and not (version.major == 0 and version.minor == 0):
+        if schema_version.major != SCHEMA_VERSION[0] and not (schema_version.major == 0 and schema_version.minor == 0):
             raise SerializeError(
                 f"Serialized schema version {exported_program.schema_version} "
                 f"does not match our current schema version {SCHEMA_VERSION}."
@@ -2312,7 +2318,7 @@ class ExportedProgramDeserializer(metaclass=Final):
             for k, v in exported_program.range_constraints.items()
         }
         res = (
-            GraphModuleDeserializer()
+            GraphModuleDeserializer(schema_version)
             .deserialize(
                 exported_program.graph_module,
                 state_dict,
